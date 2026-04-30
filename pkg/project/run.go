@@ -698,12 +698,52 @@ loop:
 	log.Info("done running stack command", "resources", len(complete.Resources))
 
 	if cmd.ProcessState.ExitCode() > 0 {
+		// iplex patch: always log pulumi.err on non-zero exit so we can
+		// triage shutdown panics. Upstream only reads this file when
+		// `!finished && len(errors) == 0` (snapshot integrity branch);
+		// the `finished && exit > 0` case (the one we hit in production)
+		// dropped pulumi's stderr silently.
+		if data, err := os.ReadFile(pulumiStderr.Name()); err == nil {
+			stderr := strings.TrimSpace(string(data))
+			if stderr != "" {
+				log.Info("iplex: pulumi exited non-zero — full pulumi.err captured",
+					"exit_code", cmd.ProcessState.ExitCode(),
+					"finished", finished,
+					"errors_count", len(errors),
+					"stderr_bytes", len(stderr),
+					"stderr", stderr)
+			} else {
+				log.Info("iplex: pulumi exited non-zero with empty stderr",
+					"exit_code", cmd.ProcessState.ExitCode(),
+					"finished", finished,
+					"errors_count", len(errors))
+			}
+		}
+
 		if hasPolicyViolations {
 			return ErrPolicyViolation
 		}
 		if hasPolicyFlag && !hasPolicyEvents && len(errors) == 0 {
 			return ErrPolicyConfigError
 		}
+
+		// iplex patch: pulumi sometimes exits non-zero (observed: 255)
+		// AFTER cleanly emitting its SummaryEvent ("finished") and with
+		// no per-resource errors. In that case the deploy operationally
+		// succeeded — every resource Created/Updated, ✓ Complete will
+		// be printed by SST CLI's UI layer — but vanilla SST treats any
+		// non-zero exit as ErrStackRunFailed. That makes the workflow
+		// fail red despite a successful deploy, blocking downstream
+		// steps (e.g. Vercel deploy in deploy-production.yml). Treat
+		// finished + no-errors as success regardless of exit code; the
+		// pulumi.err log above preserves the diagnostic for upstream
+		// investigation.
+		if finished && len(errors) == 0 {
+			log.Info("iplex: ignoring non-zero pulumi exit — deploy reached SummaryEvent with no resource errors",
+				"exit_code", cmd.ProcessState.ExitCode())
+			return nil
+		}
+
 		return ErrStackRunFailed
 	}
 	return nil
