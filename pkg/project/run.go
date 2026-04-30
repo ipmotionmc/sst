@@ -453,12 +453,27 @@ func (p *Project) Run(ctx context.Context, input *StackInput) error {
 
 	reader := bufio.NewReader(eventlog)
 
+	// partialBuf accumulates bytes from a line we read partially before
+	// hitting io.EOF — Pulumi was mid-write of an event when we caught
+	// up to the file end. bufio.Reader's internal buffer advances its
+	// read pointer when ReadBytes returns (partial, io.EOF), so without
+	// preserving these bytes here we'd lose the START of an event line
+	// permanently. The next ReadBytes call would return the line's TAIL
+	// (everything after the '\n' that eventually arrives), and
+	// json.Unmarshal would fail on the orphan fragment with errors like
+	// `invalid character 'X' looking for beginning of value` or
+	// `invalid character 'X' after top-level value`.
+	var partialBuf []byte
+
 	eofs := 0
 loop:
 	for {
 		bytes, err := reader.ReadBytes('\n')
 		if err != nil {
 			if err == io.EOF {
+				// Save the partial bytes so we can prepend them when
+				// the rest of the line arrives.
+				partialBuf = append(partialBuf, bytes...)
 				select {
 				case <-exited:
 					log.Info("eof and exited", "eofs", eofs)
@@ -473,6 +488,14 @@ loop:
 				}
 			}
 			continue
+		}
+
+		// bytes is a complete line ending with '\n'. If we accumulated
+		// any partial fragment on a previous EOF, prepend it to make a
+		// complete line.
+		if len(partialBuf) > 0 {
+			bytes = append(partialBuf, bytes...)
+			partialBuf = nil
 		}
 
 		var event events.EngineEvent
