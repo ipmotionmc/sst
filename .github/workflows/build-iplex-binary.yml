@@ -1,0 +1,87 @@
+name: build-iplex-binary
+
+# Builds a Linux x86_64 sst binary with the iplex-eventlog-fix patch
+# applied and uploads it as a GitHub Release artifact. Used by
+# ipmotionmc/iplex's deploy-production workflow to swap in our patched
+# binary in place of the upstream npm `sst` package's binary.
+#
+# Trigger: push to the `iplex-eventlog-fix` branch (or manual dispatch).
+# Output: a release tagged `<base-version>-iplex.<run-attempt>` with
+# `sst-linux-x86_64.tar.gz` attached.
+
+on:
+  push:
+    branches:
+      - iplex-eventlog-fix
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.23.2"
+          cache: true
+
+      - name: Install JS deps
+        run: bun install --frozen-lockfile
+
+      - name: Build platform (populates platform/dist/* for go:embed)
+        # Same script upstream's release.yml runs, sans DOCKER_PUSH (we
+        # only need the embedded files, not docker images for downstream
+        # consumers).
+        run: ./platform/scripts/build
+
+      - name: Build sst binary (linux/amd64)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -buildvcs=false -mod=readonly \
+              -ldflags="-buildid=" \
+              -o sst-linux-x86_64 \
+              ./cmd/sst
+
+      - name: Tar binary
+        run: tar -czf sst-linux-x86_64.tar.gz sst-linux-x86_64
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          # Base version from package.json + iplex suffix + run attempt.
+          # Example: v4.12.10-iplex.1
+          BASE=$(jq -r .version package.json)
+          TAG="v${BASE}-iplex.${{ github.run_number }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Will publish: $TAG"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # Idempotent: if release already exists, replace its asset.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" sst-linux-x86_64.tar.gz --clobber
+          else
+            gh release create "$TAG" \
+              sst-linux-x86_64.tar.gz \
+              --title "$TAG" \
+              --notes "iplex-patched sst binary. Linux x86_64 only. Patch: pkg/project/run.go preserves partial-line bytes across io.EOF in Run loop. See ipmotionmc/iplex#794 / deploy-production.yml for usage."
